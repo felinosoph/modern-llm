@@ -4,11 +4,9 @@ import torch.optim as optim
 from modern_llm.model import DecoderOnlyModel
 from modern_llm.kv_cache import BlockSpaceManager
 
-# --- 1. SETUP ---
 DEVICE = "cuda"
 DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
-# The Dictionary
 vocab = {
     "Cats": 0, "are": 1, "the": 2, "cutest": 3,
     "Will": 4, "of": 5, "Many": 6, "EOS": 7
@@ -16,21 +14,16 @@ vocab = {
 idx_to_word = {v: k for k, v in vocab.items()}
 VOCAB_SIZE = len(vocab)
 
-# The Tiny Architecture
 D_MODEL = 128
 N_HEAD = 4
 HIDDEN_DIM = 512
 N_LAYERS = 2
-
-# --- THE FIX: OBEY THE KERNEL ---
 BLOCK_SIZE = 256
 
 
 def main():
-    print(f"--- Starting 'Catify' Unit Test on {DEVICE} ---")
+    print(f"--- Starting 'Cat Test' on {DEVICE} ---")
     print(f"--- Constraints: BLOCK_SIZE={BLOCK_SIZE} ---")
-
-    # --- 2. PREPARE DATA (PACKED) ---
     data = [
         [vocab["Cats"], vocab["are"], vocab["the"], vocab["cutest"], vocab["EOS"]],
         [vocab["Will"], vocab["of"], vocab["the"], vocab["Many"], vocab["EOS"]]
@@ -50,7 +43,7 @@ def main():
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=DEVICE)
     max_seqlen = max(len(s) - 1 for s in data)
 
-    # --- 3. TRAIN (Standard Mode) ---
+
     print("\n--> Phase 1: Overfitting (Standard Training Mode)")
 
     model = DecoderOnlyModel(
@@ -79,10 +72,8 @@ def main():
     weights = model.state_dict()
     del model
 
-    # --- 4. INFERENCE (Paged Mode) ---
     print("\n--> Phase 2: Inference (Paged Attention Mode)")
 
-    # Re-init with BLOCK_SIZE = 256
     infer_model = DecoderOnlyModel(
         vocab_size=VOCAB_SIZE,
         n_layers=N_LAYERS,
@@ -101,10 +92,7 @@ def main():
         device=DEVICE
     )
 
-    # Test Case A
     run_inference(infer_model, kv_manager, "Cats", vocab["Cats"], ["are", "the", "cutest", "EOS"])
-
-    # Test Case B
     run_inference(infer_model, kv_manager, "Will", vocab["Will"], ["of", "the", "Many", "EOS"])
 
 
@@ -114,13 +102,11 @@ def run_inference(model, manager, prompt_text, prompt_id, expected_tokens):
     user_id = f"user_{prompt_text}"
     manager.allocate(user_id, 1)
     block_table, cache_seqlens = manager.get_metadata_tensors([user_id])
-
-    # Prefill
+    
     input_t = torch.tensor([[prompt_id]], device=DEVICE)
     with torch.no_grad():
         logits = model(input_t, block_table=block_table, cache_seqlens=cache_seqlens)
 
-    # Decode
     print("Generation: ", end="")
     next_token = torch.argmax(logits[0, -1]).item()
     word = idx_to_word[next_token]
