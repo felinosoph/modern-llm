@@ -1,181 +1,146 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-import math
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from modern_llm.model import DecoderOnlyModel
+from modern_llm.kv_cache import BlockSpaceManager
 
-class FlexibleAttentionLayer(nn.Module):
-    def __init__(self, d_model, n_head, mode="training", max_seq_len=None):
-        super().__init__()
-        self.d_head = d_model // n_head
-        self.n_head = n_head
-        self.mode = mode  # Store it explicitly
+# --- 1. SETUP ---
+DEVICE = "cuda"
+DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
-        self.W_q = nn.Linear(d_model, d_model, bias=False)
-        self.W_k = nn.Linear(d_model, d_model, bias=False)
-        self.W_v = nn.Linear(d_model, d_model, bias=False)
-        self.W_o = nn.Linear(d_model, d_model, bias=False)
-
-
-        if self.mode == "inference":
-            if max_seq_len is None:
-                raise ValueError("For inference mode, you MUST specify max_seq_len.")
-
-            cache_shape = (1, max_seq_len, 2, n_head, self.d_head)
-            self.register_buffer("kv_cache", torch.zeros(cache_shape, dtype=torch.float16))
-        else:
-
-            self.kv_cache = None
-
-    def forward(self, x, cu_seqlens=None, max_seqlen=None, cache_seqlens=None):
-        q = self.W_q(x)
-        k = self.W_k(x)
-        v = self.W_v(x)
-
-        if self.mode == "training":
-            q = q.view(-1, self.n_head, self.d_head)
-            k = k.view(-1, self.n_head, self.d_head)
-            v = v.view(-1, self.n_head, self.d_head)
-
-            output = flash_attn_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-                causal=True
-            )
-            output = output.view(-1, self.n_head * self.d_head)
-
-        elif self.mode == "inference":
-            # Inference Logic (Linear Kernel)
-            B, T, _ = x.shape
-            q = q.view(B, T, self.n_head, self.d_head)
-            k = k.view(B, T, self.n_head, self.d_head)
-            v = v.view(B, T, self.n_head, self.d_head)
-
-            output = flash_attn_with_kvcache(
-                q,
-                k_cache=self.kv_cache[:, :, 0],
-                v_cache=self.kv_cache[:, :, 1],
-                k=k, v=v,
-                cache_seqlens=cache_seqlens,
-                causal=True
-            )
-            output = output.view(B, T, self.n_head * self.d_head)
-
-        return self.W_o(output)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-D_MODEL = 128
-N_HEAD = 4
-MAX_SEQ_LEN = 4096
-MAX_BATCH_SIZE = 1
-
-# Precision Setup
-if torch.cuda.is_bf16_supported():
-    DTYPE = torch.bfloat16
-else:
-    DTYPE = torch.float16
+# The Dictionary
 vocab = {
     "Cats": 0, "are": 1, "the": 2, "cutest": 3,
     "Will": 4, "of": 5, "Many": 6, "EOS": 7
 }
 idx_to_word = {v: k for k, v in vocab.items()}
 VOCAB_SIZE = len(vocab)
-class TinyLLM(nn.Module):
-    def __init__(self, mode="training", max_seq_len=None):
-        super().__init__()
-        self.embed = nn.Embedding(VOCAB_SIZE, D_MODEL)
 
-        # EXPLICIT PASSING
-        self.attn = FlexibleAttentionLayer(
-            d_model=D_MODEL,
-            n_head=N_HEAD,
-            mode=mode,           # Pass the explicit mode
-            max_seq_len=max_seq_len
-        )
-        self.head = nn.Linear(D_MODEL, VOCAB_SIZE)
+# The Tiny Architecture
+D_MODEL = 128
+N_HEAD = 4
+HIDDEN_DIM = 512
+N_LAYERS = 2
 
-    def forward(self, x, cu_seqlens=None, max_seqlen=None, cache_seqlens=None):
-        h = self.embed(x)
-        h = self.attn(
-            h,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cache_seqlens=cache_seqlens
-        )
-        logits = self.head(h)
-        return logits
-
-data = [
-    [vocab["Cats"], vocab["are"], vocab["the"], vocab["cutest"], vocab["EOS"]],
-    [vocab["Will"], vocab["of"], vocab["the"], vocab["Many"], vocab["EOS"]]
-]
-flat_input = []
-flat_target = []
-cu_seqlens_list = [0]
-
-for seq in data:
-    flat_input.extend(seq[:-1])
-    flat_target.extend(seq[1:])
-    cu_seqlens_list.append(len(flat_input))
-
-packed_input = torch.tensor(flat_input, device=DEVICE)
-packed_target = torch.tensor(flat_target,device=DEVICE)
-cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=DEVICE)
-max_seqlen = max(len(s)-1 for s in data)
-
-print(f"Training Data Packed: {packed_input.tolist()}")
-print(f"Training Targets:     {packed_target.tolist()}")
-print(f"Cumulative Seqlens:   {cu_seqlens.tolist()}")
-print("\n=== STARTING TRAINING ===")
-model_train = TinyLLM(mode="training").to(DEVICE).to(DTYPE)
-optimizer = optim.AdamW(model_train.parameters(), lr=0.01) # Bumped LR slightly for tiny data
-loss_fn = nn.CrossEntropyLoss()
-
-for i in range(50): # 50 steps is plenty for 2 sentences
-    optimizer.zero_grad()
-    logits = model_train(packed_input, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-    loss = loss_fn(logits.float(), packed_target)
-    loss.backward()
-    optimizer.step()
-    if i % 10 == 0:
-        print(f"Step {i}: Loss {loss.item():.4f}")
-
-print("Training Complete.")
-
-model_infer = TinyLLM(
-    mode="inference",
-    max_seq_len=MAX_SEQ_LEN
-).to(DEVICE).to(DTYPE)
-model_infer.load_state_dict(model_train.state_dict(), strict=False)
-
-def run_inference(prompt_word):
-    print(f"\nPrompt: '{prompt_word}'")
-    token_id = vocab[prompt_word]
-
-    cache_seqlens = torch.tensor([0], dtype=torch.int32, device=DEVICE)
+# --- THE FIX: OBEY THE KERNEL ---
+BLOCK_SIZE = 256
 
 
-    x_in = torch.tensor([[token_id]], device=DEVICE)
-    output_str = prompt_word
+def main():
+    print(f"--- Starting 'Catify' Unit Test on {DEVICE} ---")
+    print(f"--- Constraints: BLOCK_SIZE={BLOCK_SIZE} ---")
+
+    # --- 2. PREPARE DATA (PACKED) ---
+    data = [
+        [vocab["Cats"], vocab["are"], vocab["the"], vocab["cutest"], vocab["EOS"]],
+        [vocab["Will"], vocab["of"], vocab["the"], vocab["Many"], vocab["EOS"]]
+    ]
+
+    flat_input = []
+    flat_target = []
+    cu_seqlens_list = [0]
+
+    for seq in data:
+        flat_input.extend(seq[:-1])
+        flat_target.extend(seq[1:])
+        cu_seqlens_list.append(len(flat_input))
+
+    packed_input = torch.tensor(flat_input, device=DEVICE)
+    packed_target = torch.tensor(flat_target, device=DEVICE)
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=DEVICE)
+    max_seqlen = max(len(s) - 1 for s in data)
+
+    # --- 3. TRAIN (Standard Mode) ---
+    print("\n--> Phase 1: Overfitting (Standard Training Mode)")
+
+    model = DecoderOnlyModel(
+        vocab_size=VOCAB_SIZE,
+        n_layers=N_LAYERS,
+        d_model=D_MODEL,
+        n_head=N_HEAD,
+        hidden_dim=HIDDEN_DIM,
+        page_block_size=None
+    ).to(DEVICE).to(DTYPE)
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-2)  # Higher LR for instant overfitting
+
+    for step in range(60):
+        optimizer.zero_grad()
+        logits = model(packed_input.unsqueeze(0), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        logits = logits.view(-1, VOCAB_SIZE)
+        loss = nn.functional.cross_entropy(logits, packed_target)
+        loss.backward()
+        optimizer.step()
+
+        if step % 10 == 0:
+            print(f"Step {step:03d}: Loss = {loss.item():.6f}")
+
+    print(f"Final Loss: {loss.item():.6f}")
+    weights = model.state_dict()
+    del model
+
+    # --- 4. INFERENCE (Paged Mode) ---
+    print("\n--> Phase 2: Inference (Paged Attention Mode)")
+
+    # Re-init with BLOCK_SIZE = 256
+    infer_model = DecoderOnlyModel(
+        vocab_size=VOCAB_SIZE,
+        n_layers=N_LAYERS,
+        d_model=D_MODEL,
+        n_head=N_HEAD,
+        hidden_dim=HIDDEN_DIM,
+        page_block_size=BLOCK_SIZE,  # Enables Paged Kernel
+        max_blocks=100
+    ).to(DEVICE).to(DTYPE)
+
+    infer_model.load_state_dict(weights, strict=False)
+
+    kv_manager = BlockSpaceManager(
+        max_blocks=100,
+        block_size=BLOCK_SIZE,
+        device=DEVICE
+    )
+
+    # Test Case A
+    run_inference(infer_model, kv_manager, "Cats", vocab["Cats"], ["are", "the", "cutest", "EOS"])
+
+    # Test Case B
+    run_inference(infer_model, kv_manager, "Will", vocab["Will"], ["of", "the", "Many", "EOS"])
 
 
-    for _ in range(5):
+def run_inference(model, manager, prompt_text, prompt_id, expected_tokens):
+    print(f"\nTesting Prompt: '{prompt_text}' (ID: {prompt_id})")
+
+    user_id = f"user_{prompt_text}"
+    manager.allocate(user_id, 1)
+    block_table, cache_seqlens = manager.get_metadata_tensors([user_id])
+
+    # Prefill
+    input_t = torch.tensor([[prompt_id]], device=DEVICE)
+    with torch.no_grad():
+        logits = model(input_t, block_table=block_table, cache_seqlens=cache_seqlens)
+
+    # Decode
+    print("Generation: ", end="")
+    next_token = torch.argmax(logits[0, -1]).item()
+    word = idx_to_word[next_token]
+    print(f"{word} ", end="")
+
+    curr_input = torch.tensor([[next_token]], device=DEVICE)
+
+    for _ in range(len(expected_tokens) - 1):
+        manager.step([user_id])
+        block_table, cache_seqlens = manager.get_metadata_tensors([user_id])
+
         with torch.no_grad():
-            logits = model_infer(x_in, cache_seqlens=cache_seqlens)
+            logits = model(curr_input, block_table=block_table, cache_seqlens=cache_seqlens)
 
-        next_token_id = torch.argmax(logits[0, 0]).item()
-        word = idx_to_word[next_token_id]
+        next_token = torch.argmax(logits[0, -1]).item()
+        print(f"{idx_to_word[next_token]} ", end="")
+        curr_input = torch.tensor([[next_token]], device=DEVICE)
 
-        if word == "EOS":
-            break
+    print("\n(Done)")
 
-        output_str += " " + word
 
-        cache_seqlens += 1
-        x_in = torch.tensor([[next_token_id]], device=DEVICE)
-
-    print(f"Generated: '{output_str}'")
-
-run_inference("Cats")
-run_inference("Will")
+if __name__ == "__main__":
+    main()
