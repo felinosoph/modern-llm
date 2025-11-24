@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from modern_llm.model import DecoderOnlyModel
-from modern_llm.kv_cache import BlockSpaceManager
+from modern_llm.kv_cache import KVCacheBlockManager
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
@@ -86,7 +86,7 @@ def main():
 
     infer_model.load_state_dict(weights, strict=False)
 
-    kv_manager = BlockSpaceManager(
+    kv_manager = KVCacheBlockManager(
         max_blocks=100,
         block_size=BLOCK_SIZE,
         device=DEVICE
@@ -100,7 +100,7 @@ def run_inference(model, manager, prompt_text, prompt_id, expected_tokens):
     print(f"\nTesting Prompt: '{prompt_text}' (ID: {prompt_id})")
 
     user_id = f"user_{prompt_text}"
-    manager.allocate(user_id, 1)
+    manager.allocate_blocks_for(user_id, 1)
     block_table, cache_seqlens = manager.get_metadata_tensors([user_id])
     
     input_t = torch.tensor([[prompt_id]], device=DEVICE)

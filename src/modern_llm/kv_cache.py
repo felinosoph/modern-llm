@@ -1,61 +1,82 @@
+from typing import List, Any, Sequence, Tuple
+
 import torch
-import torch.nn as nn
-from typing import List, Dict, Tuple, Optional
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+class KVCacheBlockManager:
+    _tokens_per_block: int
+    _max_blocks: int
+    _free_blocks: List[int]
+    _seq_len: dict[Any, int]
+    _blocks_per_sequence: dict[Any, List[int]]
 
-class BlockSpaceManager:
-    def __init__(self, max_blocks: int, block_size: int, device: str = "cuda") -> None:
-        super().__init__()
-        self.block_size: int = block_size
-        self.max_blocks: int = max_blocks
-        self.device: str = device
-        self.free_blocks: List[int] = list(range(max_blocks))
-        self.sequences: Dict[str, List[int]] = {}
-        self.seq_lens: Dict[str, int] = {}
+    def __init__(self, max_blocks: int, block_size: int) -> None:
+        self._tokens_per_block = block_size
+        self._max_blocks = max_blocks
+        self.reset()
 
-    def allocate(self, seq_id: str, prompt_len: int) -> None:
-        num_blocks_needed = (prompt_len + self.block_size - 1) // self.block_size
-        if len(self.free_blocks) < num_blocks_needed:
-            raise RuntimeError(f"OOM: Needed {num_blocks_needed} blocks, {len(self.free_blocks)} free.")
-        allocated_blocks = []
-        for _ in range(num_blocks_needed):
-            allocated_blocks.append(self.free_blocks.pop())
-        self.sequences[seq_id] = allocated_blocks
-        self.seq_lens[seq_id] = prompt_len
+    def allocate_blocks_for(self, sequence_id:Any, num_tokens: int) -> List[int]:
+        if sequence_id not in self._seq_len:
+            self._seq_len[sequence_id] = 0
+            self._blocks_per_sequence[sequence_id] = []
 
-    def step(self, seq_ids: List[str]) -> None:
-        for seq_id in seq_ids:
-            current_len = self.seq_lens[seq_id]
-            if current_len > 0 and (current_len % self.block_size == 0):
-                if not self.free_blocks:
-                    raise RuntimeError("OOM: No free blocks available during generation")
-                new_block = self.free_blocks.pop()
-                self.sequences[seq_id].append(new_block)
-            self.seq_lens[seq_id] += 1
+        seq_len = self._seq_len[sequence_id]
+        used_in_last_block = seq_len % self._tokens_per_block
 
-    def get_metadata_tensors(self, seq_ids: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = len(seq_ids)
-        max_blocks_per_seq = max(len(self.sequences[sid]) for sid in seq_ids)
-        
-        block_tables = torch.full(
-            (batch_size, max_blocks_per_seq), 
-            fill_value=-1, 
-            dtype=torch.int32, 
-            device=self.device
+
+        # the % handles the special case of the first allocation
+        # if we self.length = 0 , then used_in_last_block = 0
+        # block-used_in_last_block = block_size
+        # however, this would not create a new block in the first iteration but we want it
+        # to be generated. So we % block_size and get a block_size % block_size = 0
+        capacity_in_last_block = (self._tokens_per_block - used_in_last_block) % self._tokens_per_block
+        tokens_in_last_block = min(capacity_in_last_block, num_tokens)
+        tokens_remaining = num_tokens - tokens_in_last_block
+        num_blocks = (tokens_remaining + self._tokens_per_block - 1) // self._tokens_per_block
+        if len(self._free_blocks) < num_blocks:
+            raise RuntimeError("OOM: GPU Cache Full")
+
+        allocated = []
+        for _ in range(num_blocks):
+            allocated.append(self._free_blocks.pop())
+        self._blocks_per_sequence[sequence_id].extend(allocated)
+
+        self._seq_len[sequence_id] += num_tokens
+        return allocated
+
+    def reset(self) -> None:
+        self._free_blocks = list(range(self._max_blocks))
+        self._blocks_per_sequence = {}
+        self._seq_len = {}
+
+    def get_sequence_lengths(self, seq_ids: Sequence[Any]) -> torch.Tensor:
+        return torch.tensor(
+            [self._seq_len.get(sid, 0) for sid in seq_ids],
+            dtype=torch.long,
         )
-        cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
-        
-        for i, seq_id in enumerate(seq_ids):
-            cache_seqlens[i] = self.seq_lens[seq_id]
-            blocks = self.sequences[seq_id]
-            block_tables[i, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=self.device)
-            
-        return block_tables, cache_seqlens
 
-    def free(self, seq_id: str) -> None:
-        if seq_id in self.sequences:
-            blocks_to_free = self.sequences[seq_id]
-            self.free_blocks.extend(blocks_to_free)
-            del self.sequences[seq_id]
-            del self.seq_lens[seq_id]
+    def get_block_table_for(
+            self,
+            seq_ids: Sequence[Any],
+            device: torch.device,
+    ) -> torch.Tensor:
+        if not seq_ids:
+            return torch.empty(0, 0, dtype=torch.long, device=device)
+
+        max_len = max(len(self._blocks_per_sequence[sid]) for sid in seq_ids)
+        block_table = torch.full(
+            (len(seq_ids), max_len),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+
+        for i, sid in enumerate(seq_ids):
+            blocks = self._blocks_per_sequence.get(sid, [])
+            if blocks:
+                block_table[i, : len(blocks)] = torch.tensor(
+                    blocks,
+                    dtype=torch.long,
+                    device=device,
+                )
+
+        return block_table

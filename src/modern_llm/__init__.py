@@ -1,4 +1,4 @@
 from .model import TransformerBlock
-from .kv_cache import BlockSpaceManager
+from .kv_cache import KVCacheBlockManager
 
-__all__ = ["BlockSpaceManager", "TransformerBlock"]
+__all__ = ["KVCacheBlockManager", "TransformerBlock"]
