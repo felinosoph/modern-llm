@@ -8,12 +8,17 @@ from modern_llm.model import DecoderOnlyModel, ModelSpec
 from modern_llm.training import Trainer
 from modern_llm.data import SFTCollator
 
-# --- CONFIG ---
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 PRETRAIN_PATH = "checkpoints_pretrain/pretrain_final.pt"
+
+# --- OPTIMIZATION CHANGES ---
+# We doubled Batch Size and halved Accum Steps.
+# This keeps the math identical (Total = 128) but uses the GPU much better.
 BATCH_SIZE = 32
-ACCUM_STEPS = 4
+ACCUM_STEPS = 2
+# ----------------------------
+
 BLOCK_SIZE = 512
 D_MODEL = 512
 N_LAYERS = 8
@@ -23,22 +28,27 @@ EPOCHS = 3
 
 def main():
     print("--- SFT PHASE (Orca Instructions) ---")
-
-    # Setup
     enc = tiktoken.get_encoding("cl100k_base")
     dataset = load_dataset("Intel/orca_dpo_pairs", split="train")
     collator = SFTCollator(enc, BLOCK_SIZE)
 
     train_loader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, collate_fn=collator,
-        shuffle=True, pin_memory=True
+        dataset,
+        batch_size=BATCH_SIZE,
+        collate_fn=collator,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        # --- NEW PARAMETERS ---
+        # Keeps workers alive between epochs to avoid "startup" lag
+        persistent_workers=True,
+        # Buffers more batches in RAM so the GPU never waits
+        prefetch_factor=4
     )
 
-    # Model
     spec = ModelSpec(enc.n_vocab, N_LAYERS, D_MODEL, N_HEAD, D_MODEL * 4, BLOCK_SIZE)
     model = DecoderOnlyModel(spec).to(DEVICE).to(DTYPE)
 
-    # Load Weights
     if os.path.exists(PRETRAIN_PATH):
         print(f"Loading pretrained weights from {PRETRAIN_PATH}")
         ckpt = torch.load(PRETRAIN_PATH, map_location=DEVICE)
@@ -47,7 +57,6 @@ def main():
     else:
         print("WARNING: No pretrain checkpoint found! Training from random init.")
 
-    # Trainer (Lower LR for SFT)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
     trainer = Trainer(
         model, optimizer, train_loader,
@@ -55,7 +64,6 @@ def main():
         checkpoint_dir="checkpoints_sft"
     )
 
-    # Run
     try:
         for epoch in range(EPOCHS):
             print(f"--- Epoch {epoch + 1} ---")

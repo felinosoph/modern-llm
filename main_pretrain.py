@@ -17,23 +17,27 @@ D_MODEL = 512
 N_LAYERS = 8
 N_HEAD = 8
 
-
 def main():
     print("--- PRETRAINING PHASE (TinyStories) ---")
 
-    # Setup
     enc = tiktoken.get_encoding("cl100k_base")
-    dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+    dataset = load_dataset("roneneldan/TinyStories", split="train")
+
     collator = PretrainCollator(enc, BLOCK_SIZE)
 
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=collator)
+    train_loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        collate_fn=collator,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
 
-    # Model
     spec = ModelSpec(enc.n_vocab, N_LAYERS, D_MODEL, N_HEAD, D_MODEL * 4, BLOCK_SIZE)
     model = DecoderOnlyModel(spec).to(DEVICE).to(DTYPE)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
-    # Trainer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
     trainer = Trainer(
         model, optimizer, train_loader,
@@ -41,13 +45,11 @@ def main():
         checkpoint_dir="checkpoints_pretrain"
     )
 
-    # Run
     try:
-        trainer.train_epoch(0)  # Infinite streaming epoch
+        trainer.train_epoch(0)
     except KeyboardInterrupt:
         print("Saving Checkpoint...")
         trainer.save_checkpoint("pretrain_final.pt")
-
 
 if __name__ == "__main__":
     main()
