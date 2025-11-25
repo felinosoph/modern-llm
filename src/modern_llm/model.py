@@ -15,12 +15,13 @@ class ModelSpec:
     d_model: int
     n_head: int
     hidden_dim: int
+    max_seq_len: int
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_head, hidden_dim, page_block_size=None, max_blocks=None):
+    def __init__(self, d_model, n_head, hidden_dim, max_seq_len, page_block_size=None, max_blocks=None):
         super().__init__()
         self.attention_norm = nn.RMSNorm(d_model)
-        self.attention = FlexibleAttentionLayer(d_model, n_head, page_block_size, max_blocks)
+        self.attention = FlexibleAttentionLayer(d_model, n_head, max_seq_len, page_block_size, max_blocks)
         self.mlp_norm = nn.RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, hidden_dim)
 
@@ -64,10 +65,15 @@ class DecoderOnlyModel(nn.Module):
         self.embed_tokens = nn.Embedding(model_spec.vocab_size, model_spec.d_model)
 
         self.layers = nn.ModuleList([
-            TransformerBlock(model_spec.d_model, model_spec.n_head, model_spec.hidden_dim)
+            # Pass max_seq_len from spec to block
+            TransformerBlock(
+                d_model=model_spec.d_model,
+                n_head=model_spec.n_head,
+                hidden_dim=model_spec.hidden_dim,
+                max_seq_len=model_spec.max_seq_len
+            )
             for _ in range(model_spec.n_layers)
         ])
-
         self.norm = nn.RMSNorm(model_spec.d_model)
         self.lm_head = nn.Linear(model_spec.d_model, model_spec.vocab_size, bias=False)
 

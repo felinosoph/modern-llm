@@ -44,11 +44,13 @@ class Trainer:
         Override this method later for DPO!
         """
         input_ids = batch["input_ids"].to(self.device)
-        labels = batch["labels"].to(self.device)  # Usually input_ids shifted by 1
+        labels = batch["labels"].to(self.device)
 
-        # Metadata for attention (if your model uses it)
-        # We assume the collate_fn handles the creation of these
+        # FIX: Move cu_seqlens to GPU!
         cu_seqlens = batch.get("cu_seqlens", None)
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.to(self.device)
+
         max_seqlen = batch.get("max_seqlen", None)
 
         # Forward Pass
