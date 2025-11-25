@@ -1,131 +1,130 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from modern_llm.model import DecoderOnlyModel
-from modern_llm.kv_cache import KVCacheBlockManager
+import tiktoken
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+
+from modern_llm.model import DecoderOnlyModel, ModelSpec
+from modern_llm.training import Trainer
+
+# --- Config for RTX 4080 ---
+BATCH_SIZE = 8  # Reduced for stability with slightly longer texts
+ACCUM_STEPS = 8  # Effective batch = 64
+BLOCK_SIZE = 512
+D_MODEL = 256
+N_LAYERS = 8
+N_HEAD = 8
+MAX_STEPS = 5000
 
 DEVICE = "cuda"
-DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-
-vocab = {
-    "Cats": 0, "are": 1, "the": 2, "cutest": 3,
-    "Will": 4, "of": 5, "Many": 6, "EOS": 7
-}
-idx_to_word = {v: k for k, v in vocab.items()}
-VOCAB_SIZE = len(vocab)
-
-D_MODEL = 128
-N_HEAD = 4
-HIDDEN_DIM = 512
-N_LAYERS = 2
-BLOCK_SIZE = 256
+DTYPE = torch.bfloat16
 
 
 def main():
-    print(f"--- Starting 'Cat Test' on {DEVICE} ---")
-    print(f"--- Constraints: BLOCK_SIZE={BLOCK_SIZE} ---")
-    data = [
-        [vocab["Cats"], vocab["are"], vocab["the"], vocab["cutest"], vocab["EOS"]],
-        [vocab["Will"], vocab["of"], vocab["the"], vocab["Many"], vocab["EOS"]]
-    ]
+    # 1. Tokenizer
+    enc = tiktoken.get_encoding("cl100k_base")
+    vocab_size = enc.n_vocab
+    print(f"Vocab Size: {vocab_size}")
 
-    flat_input = []
-    flat_target = []
-    cu_seqlens_list = [0]
+    # 2. Dataset: Intel Orca DPO Pairs
+    # We use this for BOTH SFT (now) and DPO (later)
+    print("Loading Intel/orca_dpo_pairs...")
+    dataset = load_dataset("Intel/orca_dpo_pairs", split="train")
 
-    for seq in data:
-        flat_input.extend(seq[:-1])
-        flat_target.extend(seq[1:])
-        cu_seqlens_list.append(len(flat_input))
+    # Note: We don't stream here because it's small (~12k rows) and fits in RAM easily.
 
-    packed_input = torch.tensor(flat_input, device=DEVICE)
-    packed_target = torch.tensor(flat_target, device=DEVICE)
-    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=DEVICE)
-    max_seqlen = max(len(s) - 1 for s in data)
+    # 3. Formatter: Raw Data -> Chat Format
+    def format_prompt(row):
+        # We ignore 'rejected' for SFT training
+        sys = row.get('system', '')
+        ques = row.get('question', '')
+        ans = row.get('chosen', '')
 
+        # Simple Chat Format
+        # User: <question>
+        # Assistant: <answer>
+        text = f"User: {sys} {ques}\nAssistant: {ans}"
+        return text
 
-    print("\n--> Phase 1: Overfitting (Standard Training Mode)")
+    # 4. Collate Function
+    def collate_fn(batch_list):
+        flat_input = []
+        cu_seqlens = [0]
+        labels = []
 
-    model = DecoderOnlyModel(
-        vocab_size=VOCAB_SIZE,
-        n_layers=N_LAYERS,
-        d_model=D_MODEL,
-        n_head=N_HEAD,
-        hidden_dim=HIDDEN_DIM,
-        page_block_size=None
-    ).to(DEVICE).to(DTYPE)
+        for item in batch_list:
+            text = format_prompt(item)
+            tokens = enc.encode(text)
 
-    optimizer = optim.AdamW(model.parameters(), lr=1e-2)  # Higher LR for instant overfitting
+            # Truncate to block size
+            if len(tokens) > BLOCK_SIZE:
+                tokens = tokens[:BLOCK_SIZE]
 
-    for step in range(60):
-        optimizer.zero_grad()
-        logits = model(packed_input.unsqueeze(0), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-        logits = logits.view(-1, VOCAB_SIZE)
-        loss = nn.functional.cross_entropy(logits, packed_target)
-        loss.backward()
-        optimizer.step()
+            # Create Inputs/Labels for Next Token Prediction
+            flat_input.extend(tokens[:-1])
+            labels.extend(tokens[1:])
+            cu_seqlens.append(len(flat_input))
 
-        if step % 10 == 0:
-            print(f"Step {step:03d}: Loss = {loss.item():.6f}")
+        # Tensorize
+        input_tensor = torch.tensor(flat_input, dtype=torch.long)
+        label_tensor = torch.tensor(labels, dtype=torch.long)
+        cu_tensor = torch.tensor(cu_seqlens, dtype=torch.int32)
 
-    print(f"Final Loss: {loss.item():.6f}")
-    weights = model.state_dict()
-    del model
+        # Calculate max_seqlen for Flash Attention
+        seq_lens = cu_tensor[1:] - cu_tensor[:-1]
+        max_seq = torch.max(seq_lens).item()
 
-    print("\n--> Phase 2: Inference (Paged Attention Mode)")
+        return {
+            "input_ids": input_tensor,
+            "labels": label_tensor,
+            "cu_seqlens": cu_tensor,
+            "max_seqlen": max_seq
+        }
 
-    infer_model = DecoderOnlyModel(
-        vocab_size=VOCAB_SIZE,
-        n_layers=N_LAYERS,
-        d_model=D_MODEL,
-        n_head=N_HEAD,
-        hidden_dim=HIDDEN_DIM,
-        page_block_size=BLOCK_SIZE,  # Enables Paged Kernel
-        max_blocks=100
-    ).to(DEVICE).to(DTYPE)
-
-    infer_model.load_state_dict(weights, strict=False)
-
-    kv_manager = KVCacheBlockManager(
-        max_blocks=100,
-        block_size=BLOCK_SIZE,
-        device=DEVICE
+    # DataLoader
+    train_loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        collate_fn=collate_fn,
+        shuffle=True,
+        drop_last=True
     )
 
-    run_inference(infer_model, kv_manager, "Cats", vocab["Cats"], ["are", "the", "cutest", "EOS"])
-    run_inference(infer_model, kv_manager, "Will", vocab["Will"], ["of", "the", "Many", "EOS"])
+    # 5. Model Setup
+    spec = ModelSpec(
+        vocab_size=vocab_size,
+        n_layers=N_LAYERS,
+        d_model=D_MODEL,
+        n_head=N_HEAD,
+        hidden_dim=D_MODEL * 4
+    )
 
+    model = DecoderOnlyModel(spec).to(DEVICE).to(DTYPE)
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
-def run_inference(model, manager, prompt_text, prompt_id, expected_tokens):
-    print(f"\nTesting Prompt: '{prompt_text}' (ID: {prompt_id})")
+    # 6. Training Setup
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
 
-    user_id = f"user_{prompt_text}"
-    manager.allocate_blocks_for(user_id, 1)
-    block_table, cache_seqlens = manager.get_metadata_tensors([user_id])
-    
-    input_t = torch.tensor([[prompt_id]], device=DEVICE)
-    with torch.no_grad():
-        logits = model(input_t, block_table=block_table, cache_seqlens=cache_seqlens)
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_dataloader=train_loader,
+        grad_accum_steps=ACCUM_STEPS,
+        device=DEVICE,
+        dtype=DTYPE,
+        log_interval=10
+    )
 
-    print("Generation: ", end="")
-    next_token = torch.argmax(logits[0, -1]).item()
-    word = idx_to_word[next_token]
-    print(f"{word} ", end="")
+    # 7. Execution
+    print("Starting SFT on Orca Pairs (Chosen)...")
+    try:
+        # Train for a few epochs since dataset is small (12k)
+        for epoch in range(3):
+            trainer.train_epoch(epoch_idx=epoch)
+            trainer.save_checkpoint(f"orca_sft_epoch_{epoch}.pt")
 
-    curr_input = torch.tensor([[next_token]], device=DEVICE)
-
-    for _ in range(len(expected_tokens) - 1):
-        manager.step([user_id])
-        block_table, cache_seqlens = manager.get_metadata_tensors([user_id])
-
-        with torch.no_grad():
-            logits = model(curr_input, block_table=block_table, cache_seqlens=cache_seqlens)
-
-        next_token = torch.argmax(logits[0, -1]).item()
-        print(f"{idx_to_word[next_token]} ", end="")
-        curr_input = torch.tensor([[next_token]], device=DEVICE)
-
-    print("\n(Done)")
+    except KeyboardInterrupt:
+        print("Saving emergency checkpoint...")
+        trainer.save_checkpoint("interrupted.pt")
 
 
 if __name__ == "__main__":

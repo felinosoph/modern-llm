@@ -2,6 +2,40 @@ from typing import List, Any, Sequence, Tuple
 
 import torch
 
+def write_to_kv_cache(
+        cu_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        kv_cache: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor):
+    device = k.device
+    block_size = kv_cache.size(3)
+    # this basically generate the length of each sequence
+    # from the cumsum
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+
+    # repeates each 0, 1, ... n , where n = index of last sequence,
+    # for as many times as tokens are in the sequence
+    batch_indices = torch.repeat_interleave(
+        torch.arange(len(seq_lens), device=device),
+        seq_lens
+    )
+
+    total_tokens = seq_lens.sum().item()
+    global_indices = torch.arange(total_tokens, device=device)
+    # the start of the next sequence is cumsum of the previous sequence
+    # we repeat those for each sequence as many times as that
+    # sequence has tokens = batch_indices
+    seq_starts = cu_seqlens[:-1][batch_indices]
+    seq_indices = global_indices - seq_starts
+    logical_block = seq_indices // block_size
+
+    offset = seq_indices % block_size
+
+    physical_block = block_table[batch_indices, logical_block]
+    kv_cache[physical_block, 0, :, offset, :] = k
+    kv_cache[physical_block, 1, :, offset, :] = v
+
 class KVCacheBlockManager:
     _tokens_per_block: int
     _max_blocks: int
